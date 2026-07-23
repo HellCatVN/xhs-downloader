@@ -11,7 +11,7 @@ from asyncio import (
 from contextlib import suppress
 from datetime import datetime
 from re import compile
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from textwrap import dedent
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
@@ -40,12 +40,15 @@ from ..module import (
     VERSION_MAJOR,
     VERSION_MINOR,
     WARNING,
+    CreatorBatchData,
+    CreatorBatchParams,
     DataRecorder,
     ExtractData,
     ExtractParams,
     IDRecorder,
     Manager,
     MapRecorder,
+    NoteSummary,
     logging,
     # sleep_time,
     ScriptServer,
@@ -58,6 +61,7 @@ from .download import Download
 from .explore import Explore
 from .image import Image
 from .request import Html
+from .user_posted import UserPosted
 from .video import Video
 from rich import print
 
@@ -110,6 +114,10 @@ class XHS:
     SHORT = compile(r"(?:https?://)?xhslink\.com/[^\s\"<>\\^`{|}，。；！？、【】《》]+")
     ID = compile(r"(?:explore|item)/(\S+)?\?")
     ID_USER = compile(r"user/profile/[a-z0-9]+/(\S+)?\?")
+    CREATOR_PROFILE = compile(
+        r"^(?:https?://)?(?:www\.)?(?:xiaohongshu\.com|rednote\.com)/user/profile/([^/?#]+)(?:[/?#].*)?$"
+    )
+    CREATOR_ID = compile(r"^[a-zA-Z0-9_-]+$")
     __INSTANCE = None
     CLEANER = Cleaner()
 
@@ -680,6 +688,205 @@ class XHS:
         await self.stop_script_server()
         await self.manager.close()
 
+    def _creator_identity(self, value: str) -> tuple[str, str] | None:
+        value = value.strip()
+        if match := self.CREATOR_PROFILE.fullmatch(value):
+            profile_url = value if value.startswith("http") else f"https://{value}"
+            return match.group(1), profile_url
+        user_id = value.removeprefix("@")
+        if self.CREATOR_ID.fullmatch(user_id):
+            return user_id, f"https://www.xiaohongshu.com/user/profile/{user_id}"
+        return None
+
+    @staticmethod
+    def _creator_note_url(note: dict) -> str:
+        note_id = note["note_id"]
+        if not (token := note.get("xsec_token")):
+            return f"https://www.xiaohongshu.com/explore/{note_id}"
+        query = urlencode(
+            {
+                "source": "webshare",
+                "xhsshare": "pc_web",
+                "xsec_token": token,
+                "xsec_source": "pc_share",
+            }
+        )
+        return f"https://www.xiaohongshu.com/discovery/item/{note_id}?{query}"
+
+    @staticmethod
+    def _media_urls(value) -> list[str]:
+        if isinstance(value, str):
+            value = value.split()
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if item and str(item).lower() != "nan"]
+
+    def _note_summary(self, note: dict, data: dict) -> NoteSummary | None:
+        note_id = data.get("作品ID") or note["note_id"]
+        images = self._media_urls(data.get("下载地址"))
+        live = self._media_urls(data.get("动图地址"))
+        work_type = data.get("作品类型")
+        cover_url = note.get("cover_url")
+        if live:
+            kind = "livephoto"
+            media_urls = list(dict.fromkeys([*images, *live]))
+            cover_url = cover_url or (images[0] if images else None)
+        elif work_type == _("视频"):
+            kind = "video"
+            media_urls = images
+            if not cover_url:
+                return None
+        else:
+            kind = "images"
+            media_urls = images
+            cover_url = cover_url or (images[0] if images else None)
+        if not media_urls:
+            return None
+        return NoteSummary(
+            note_id=str(note_id),
+            desc=str(data.get("作品描述") or data.get("作品标题") or ""),
+            kind=kind,
+            media_urls=media_urls,
+            cover_url=cover_url,
+        )
+
+    async def _resolve_creator_notes(
+        self,
+        notes: list[dict],
+        extract: CreatorBatchParams,
+        attempted: set[str],
+    ) -> tuple[list[NoteSummary], int]:
+        result = []
+        errors = 0
+        for note in notes:
+            if (note_id := note["note_id"]) in attempted:
+                continue
+            attempted.add(note_id)
+            try:
+                data = await self.__deal_extract(
+                    self._creator_note_url(note),
+                    False,
+                    None,
+                    True,
+                    extract.cookie,
+                    extract.proxy,
+                )
+                if not isinstance(data, dict) or not (
+                    summary := self._note_summary(note, data)
+                ):
+                    errors += 1
+                    continue
+                result.append(summary)
+            except Exception as error:
+                self.logging(
+                    "Note {0} failed and was skipped: {1}".format(
+                        note_id, type(error).__name__
+                    ),
+                    WARNING,
+                )
+                errors += 1
+        return result, errors
+
+    async def _creator_batch(
+        self,
+        extract: CreatorBatchParams,
+    ) -> CreatorBatchData:
+        if not (identity := self._creator_identity(extract.url)):
+            return CreatorBatchData(
+                message="Fetched 0 notes, 0 errors; invalid creator URL or user_id",
+                params=extract,
+                data=[],
+                next_cursor=None,
+            )
+        user_id, profile_url = identity
+        html = await self.html.request_url(
+            profile_url,
+            cookie=extract.cookie,
+            proxy=extract.proxy,
+        )
+        try:
+            initial_notes = UserPosted.extract_initial_notes(
+                self.convert.initial_state(html)
+            )
+        except Exception as error:
+            self.logging(
+                "Failed to parse creator profile: {0}".format(type(error).__name__),
+                WARNING,
+            )
+            initial_notes = []
+
+        result = []
+        errors = 0
+        attempted = set()
+        pages = 0
+        cursor = extract.cursor
+        next_cursor = None
+        feed_failed = False
+
+        if not cursor and initial_notes:
+            page = initial_notes[: extract.page_size]
+            summaries, page_errors = await self._resolve_creator_notes(
+                page, extract, attempted
+            )
+            result.extend(summaries)
+            errors += page_errors
+            pages += 1
+            if len(page) == extract.page_size:
+                cursor = page[-1]["note_id"]
+                next_cursor = cursor
+
+        while pages < extract.max_pages and (cursor or not initial_notes):
+            try:
+                response = await UserPosted(
+                    self.manager,
+                    {
+                        "num": extract.page_size,
+                        "cursor": cursor,
+                        "user_id": user_id,
+                        "image_formats": "jpg,webp,avif",
+                    },
+                    extract.cookie,
+                    extract.proxy,
+                ).get_data()
+            except Exception as error:
+                self.logging(
+                    "Failed to fetch creator feed page: {0}".format(
+                        type(error).__name__
+                    ),
+                    WARNING,
+                )
+                feed_failed = True
+                next_cursor = cursor or None
+                break
+            if isinstance(response, dict) and response.get("success") is False:
+                feed_failed = True
+                next_cursor = cursor or None
+                break
+            page, following_cursor = UserPosted.extract_api_page(response)
+            if not page:
+                next_cursor = None
+                break
+            summaries, page_errors = await self._resolve_creator_notes(
+                page[: extract.page_size], extract, attempted
+            )
+            result.extend(summaries)
+            errors += page_errors
+            pages += 1
+            next_cursor = following_cursor
+            if not following_cursor or following_cursor == cursor:
+                break
+            cursor = following_cursor
+
+        message = f"Fetched {len(result)} notes, {errors} errors"
+        if feed_failed:
+            message += "; creator feed page failed"
+        return CreatorBatchData(
+            message=message,
+            params=extract,
+            data=result,
+            next_cursor=next_cursor,
+        )
+
     # @staticmethod
     # def read_browser_cookie(value: str | int) -> str:
     #     return (
@@ -765,6 +972,38 @@ class XHS:
                 else:
                     msg = _("获取小红书作品数据失败")
             return ExtractData(message=msg, params=extract, data=data)
+
+        @server.post(
+            "/xhs/creator/batch",
+            summary=_("分页获取作者作品"),
+            description=_(
+                dedent("""
+                **参数**:
+
+                - **url**: 作者主页链接、@handle 或作者 ID；必需参数
+                - **cookie**: 请求数据时使用的 Cookie；可选参数
+                - **proxy**: 请求数据时使用的代理；可选参数
+                - **cursor**: 从指定游标继续获取；可选参数
+                - **page_size**: 每页作品数量；可选参数，默认 18
+                - **max_pages**: 单次请求最多获取页数；可选参数，默认 30
+                """)
+            ),
+            tags=["API"],
+            response_model=CreatorBatchData,
+        )
+        async def handle_creator_batch(extract: CreatorBatchParams):
+            try:
+                return await self._creator_batch(extract)
+            except Exception as error:
+                self.logging(
+                    "Creator feed request failed: {0}".format(type(error).__name__), ERROR
+                )
+                return CreatorBatchData(
+                    message="Fetched 0 notes, 0 errors; creator feed request failed",
+                    params=extract,
+                    data=[],
+                    next_cursor=None,
+                )
 
     async def run_mcp_server(
         self,

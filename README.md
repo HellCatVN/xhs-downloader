@@ -213,6 +213,44 @@ async def example_api():
     response = post(server, json=data, timeout=10)
     print(response.json())
 </pre>
+<h2>Additional endpoints vs upstream</h2>
+<p>This fork adds <code>POST /xhs/creator/batch</code> for cursor-based creator-feed pagination. It accepts a creator profile URL, <code>@handle</code>, or user ID, resolves each note with the existing XHS extraction pipeline, and skips individual notes that fail.</p>
+<p><b>Sample request:</b></p>
+<pre>
+{
+  "url": "https://www.xiaohongshu.com/user/profile/creator_id",
+  "cookie": "",
+  "proxy": "",
+  "cursor": "",
+  "page_size": 18,
+  "max_pages": 30
+}
+</pre>
+<p><b>Sample response:</b></p>
+<pre>
+{
+  "message": "Fetched 1 notes, 0 errors",
+  "params": {
+    "url": "https://www.xiaohongshu.com/user/profile/creator_id",
+    "cookie": "",
+    "proxy": "",
+    "cursor": "",
+    "page_size": 18,
+    "max_pages": 30
+  },
+  "data": [
+    {
+      "note_id": "note_id",
+      "desc": "Example note",
+      "kind": "images",
+      "media_urls": ["https://ci.xiaohongshu.com/example"],
+      "cover_url": "https://ci.xiaohongshu.com/example"
+    }
+  ],
+  "next_cursor": null
+}
+</pre>
+<p>Runtime failures are returned as HTTP 200 with details in <code>message</code> and an empty <code>data</code> list. Per-note failures increment the error count without aborting the remaining batch.</p>
 <h2>MCP 模式</h2>
 <p><b>启动：</b>运行命令：<code>python .\main.py mcp</code></p>
 <p><b>关闭：</b>按下 <code>Ctrl</code> + <code>C</code> 关闭服务器</p>
