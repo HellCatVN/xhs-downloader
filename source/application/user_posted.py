@@ -86,7 +86,13 @@ class UserPosted:
 
     @classmethod
     def extract_initial_notes(cls, state: dict) -> list[dict]:
-        raw = cls._path(state, "user", "notes", "_rawValue")
+        # Vendor patch: XHS's `__INITIAL_STATE__` exposes the resolved
+        # `user.notes` array directly (one entry per sub-tab, the first
+        # is the active "笔记" tab). The earlier "_rawValue" suffix was
+        # an Immer-draft guess that never matched the rendered HTML.
+        # See plans/260723-1056-xhs-downloader-integration/research/
+        #     xhs-engine-spike-report.md §3
+        raw = cls._path(state, "user", "notes")
         if isinstance(raw, dict):
             raw = raw.get(0) or raw.get("0") or next(iter(raw.values()), [])
         elif isinstance(raw, list) and raw and isinstance(raw[0], list):
