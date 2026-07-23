@@ -964,7 +964,7 @@ class XHS:
             async def process_page(page_items: list, page_idx: int):
                 nonlocal saved, errors, result
                 if not page_items:
-                    return False
+                    return
                 summaries, page_errors = await self._resolve_creator_notes(
                     page_items[: extract.page_size], extract, attempted
                 )
@@ -980,7 +980,6 @@ class XHS:
                     "message": f"Page {page_idx}: +{len(summaries)} notes",
                     "params": extract.model_dump() if hasattr(extract, "model_dump") else dict(extract),
                 })
-                return True
 
             if not cursor and initial_notes:
                 pages = 1
