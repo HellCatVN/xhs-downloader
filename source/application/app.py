@@ -888,6 +888,178 @@ class XHS:
         )
 
     # @staticmethod
+    # Vendor patch (creator-batch streaming):
+    #
+    # The synchronous `/xhs/creator/batch` endpoint buffers the entire
+    # result before responding — for large authors (200+ notes, slow XHS
+    # upstream) this can take several minutes. The browser/client
+    # fetch can hit a 30s default timeout before the response starts.
+    #
+    # The streaming endpoint below uses Server-Sent Events format
+    # (`data: <json>\n\n`) so the client can:
+    #   - See per-page / per-batch progress
+    #   - Cancel the underlying fetch without losing partial results
+    #   - Drive the UI's "X of Y" progress display
+    async def _creator_batch_stream(
+        self,
+        extract: "CreatorBatchParams",
+    ):
+        """Generator that yields SSE-formatted events as the creator
+        batch progresses. Event shape:
+          { kind: "start" | "page" | "done" | "error",
+            page?: int, items?: [NoteSummary], saved: int, errors: int,
+            message: string, params: CreatorBatchParams,
+            next_cursor?: string }
+        """
+        import json as _json
+        from fastapi.responses import StreamingResponse
+
+        def sse(obj: dict) -> bytes:
+            return f"data: {_json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        try:
+            identity = self._creator_identity(extract.url)
+            if not identity:
+                yield sse({
+                    "kind": "error",
+                    "page": 0,
+                    "items": [],
+                    "saved": 0,
+                    "errors": 0,
+                    "message": "Fetched 0 notes, 0 errors; invalid creator URL or user_id",
+                    "params": extract.model_dump() if hasattr(extract, "model_dump") else dict(extract),
+                })
+                return
+
+            user_id, profile_url = identity
+            yield sse({
+                "kind": "start",
+                "page": 0,
+                "items": [],
+                "saved": 0,
+                "errors": 0,
+                "message": f"Fetching creator {user_id}...",
+                "params": extract.model_dump() if hasattr(extract, "model_dump") else dict(extract),
+            })
+
+            html = await self.html.request_url(
+                profile_url, cookie=extract.cookie, proxy=extract.proxy,
+            )
+            try:
+                initial_notes = UserPosted.extract_initial_notes(
+                    self.convert.initial_state(html)
+                )
+            except Exception as error:
+                initial_notes = []
+
+            result = []
+            errors = 0
+            attempted = set()
+            pages = 0
+            cursor = extract.cursor
+            next_cursor = None
+            feed_failed = False
+            saved = 0
+
+            async def process_page(page_items: list, page_idx: int):
+                nonlocal saved, errors, result
+                if not page_items:
+                    return False
+                summaries, page_errors = await self._resolve_creator_notes(
+                    page_items[: extract.page_size], extract, attempted
+                )
+                result.extend(summaries)
+                errors += page_errors
+                saved += sum(1 for s in summaries if s)
+                yield sse({
+                    "kind": "page",
+                    "page": page_idx,
+                    "items": [s.dict() if hasattr(s, "dict") else s for s in summaries],
+                    "saved": saved,
+                    "errors": errors,
+                    "message": f"Page {page_idx}: +{len(summaries)} notes",
+                    "params": extract.model_dump() if hasattr(extract, "model_dump") else dict(extract),
+                })
+                return True
+
+            if not cursor and initial_notes:
+                pages = 1
+                async for ev in process_page(initial_notes, pages):
+                    yield ev
+                if len(initial_notes) >= extract.page_size:
+                    cursor = initial_notes[-1]["note_id"]
+
+            while pages < extract.max_pages and (cursor or not initial_notes):
+                try:
+                    response = await UserPosted(
+                        self.manager,
+                        {
+                            "num": extract.page_size,
+                            "cursor": cursor,
+                            "user_id": user_id,
+                            "image_formats": "jpg,webp,avif",
+                        },
+                        extract.cookie,
+                        extract.proxy,
+                    ).get_data()
+                except Exception:
+                    feed_failed = True
+                    next_cursor = cursor or None
+                    break
+                if isinstance(response, dict) and response.get("success") is False:
+                    feed_failed = True
+                    next_cursor = cursor or None
+                    break
+                page, following_cursor = UserPosted.extract_api_page(response)
+                if not page:
+                    next_cursor = None
+                    break
+                pages += 1
+                async for ev in process_page(page, pages):
+                    yield ev
+                next_cursor = following_cursor
+                if not following_cursor or following_cursor == cursor:
+                    break
+                cursor = following_cursor
+
+            final_message = f"Fetched {len(result)} notes, {errors} errors"
+            if feed_failed:
+                final_message += "; creator feed page failed"
+            yield sse({
+                "kind": "done",
+                "page": pages,
+                "items": [],
+                "saved": saved,
+                "errors": errors,
+                "message": final_message,
+                "params": extract.model_dump() if hasattr(extract, "model_dump") else dict(extract),
+                "next_cursor": next_cursor,
+            })
+        except Exception as e:
+            yield sse({
+                "kind": "error",
+                "page": 0,
+                "items": [],
+                "saved": 0,
+                "errors": 1,
+                "message": str(e),
+                "params": {},
+            })
+
+    def handle_creator_batch_stream(self, extract: "CreatorBatchParams"):
+        """Route handler that streams SSE events from the creator batch."""
+        from fastapi.responses import StreamingResponse
+
+        return StreamingResponse(
+            self._creator_batch_stream(extract),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # @staticmethod
     # def read_browser_cookie(value: str | int) -> str:
     #     return (
     #         BrowserCookie.get(
@@ -1004,6 +1176,21 @@ class XHS:
                     data=[],
                     next_cursor=None,
                 )
+
+        @server.post(
+            "/xhs/creator/batch/stream",
+            summary=_("分页获取作者作品 (SSE 流式)"),
+            description=_(
+                "Server-Sent Events variant of /xhs/creator/batch. Streams "
+                "`data: <json>\\n\\n` events (`{kind: start|page|done|error, ...}`) "
+                "as each page is processed — avoids the synchronous 30s+ "
+                "timeout for large authors. Recommended for creators with "
+                ">20 notes."
+            ),
+            tags=["API"],
+        )
+        def handle_creator_batch_stream_route(extract: CreatorBatchParams):
+            return self.handle_creator_batch_stream(extract)
 
     async def run_mcp_server(
         self,
